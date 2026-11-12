@@ -108,12 +108,12 @@ Snowflake offers a 30-day free trial with $400 in credits — enough to learn ev
 ```
 Cloud Provider Options:
 ├── AWS
-│   ├── US East (N. Virginia)      ← recommended for US learners
+│   ├── US East (N. Virginia)
 │   ├── US West (Oregon)
 │   ├── EU (Frankfurt)
 │   └── AP (Singapore, Sydney, Tokyo...)
 ├── Azure
-│   ├── East US 2
+│   ├── East US 2                  ← recommended for this course
 │   ├── West Europe
 │   └── Southeast Asia
 └── GCP
@@ -121,7 +121,7 @@ Cloud Provider Options:
     └── Europe West (Netherlands)
 ```
 
-**Recommendation:** Choose AWS US East (N. Virginia) for the trial — it has the most features and lowest latency for most learners.
+**Recommendation:** Choose **Azure East US 2** for the trial — this course uses Azure-based tooling (dbt, Airflow on Azure), so keeping Snowflake on the same cloud avoids cross-cloud data transfer and aligns with the rest of the stack.
 
 **Step 3: Choose your Snowflake edition**
 
