@@ -30,6 +30,21 @@ The error message says "upgrade your account" but **upgrading does not fix it** 
 
 ---
 
+## Can You Change the Region on an Existing Account?
+
+**No — the region cannot be changed after account creation.** It is permanent.
+
+The region is set at signup because your data physically lives in that cloud region's storage. Moving it would require migrating all data to a different data center, which Snowflake does not support as a self-service operation for trial accounts.
+
+| Option | Works? | Notes |
+|---|---|---|
+| Change region in account settings | No | Not possible — region is locked at creation |
+| Contact Snowflake support to migrate | No | Only for paid enterprise accounts, not trials |
+| Create a new trial account | Yes | Easiest fix — no data to lose at this stage |
+| Stay on current region and ignore Cortex | Yes | Everything else in this course still works |
+
+---
+
 ## The Fix — Use Azure East US 2
 
 The simplest fix is to **create a new trial account** with the correct region. Trial accounts are free and you can have one per email address.
