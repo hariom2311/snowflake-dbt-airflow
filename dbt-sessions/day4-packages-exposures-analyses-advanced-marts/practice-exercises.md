@@ -1,601 +1,782 @@
-# Day 4 — Practice Exercises: Packages, Exposures, Analyses, and Advanced Mart Modeling
+# Day 4 — Practice Exercises: End-to-End Project
 
-> All exercises build on the `ecomm_dbt` project from Day 3.
-> Seeds (`products.csv`, `employees.csv`) must be loaded and staging models (`stg_orders`, `stg_products`, `stg_employees`) must be running before you start.
+> Build the full pipeline from scratch: seeds → staging (dedup + incremental) → tests → snapshot → gold (dim + fact).
 > Run all dbt commands from inside the `ecomm_dbt/` project directory.
-> Estimated total time: 75–90 minutes.
+> Estimated total time: 90–120 minutes.
 
 ---
 
 ## Pre-Check
 
+Confirm the project is working from Day 3:
+
 ```bash
-dbt seed
 dbt run
 dbt test
 ```
 
-Expected: all models pass, no test failures. If any model fails, fix it before proceeding.
+If anything is broken, fix it before starting Day 4.
 
 ---
 
-## Exercise 1 — Install dbt-utils
+## Exercise 1 — Create the Raw Data Seeds
 
 ### Goal
-Add dbt-utils to the project and verify the package is accessible.
-
-### Step 1: Create `packages.yml`
-
-At the root of `ecomm_dbt/` (same level as `dbt_project.yml`), create:
-
-```yaml
-packages:
-  - package: dbt-labs/dbt_utils
-    version: 1.3.0
-```
-
-### Step 2: Install packages
-
-```bash
-dbt deps
-```
-
-Expected output:
-```
-Installing dbt-labs/dbt_utils@1.3.0
-  Installed from version 1.3.0
-  Up to date!
-```
-
-### Step 3: Add `dbt_packages/` to `.gitignore`
-
-Open or create `.gitignore` at the project root and add:
-
-```
-dbt_packages/
-target/
-logs/
-```
-
-### Step 4: Verify the package loaded
-
-```bash
-dbt compile
-```
-
-No errors = package is installed correctly.
-
-**Checkpoint:** `dbt_packages/dbt_utils/` folder exists in your project.
-
----
-
-## Exercise 2 — Add an Intermediate Layer
-
-### Goal
-Add an `intermediate/` folder to `dbt_project.yml` and create `int_orders_enriched.sql` — a model that joins `stg_orders` with `stg_products` and adds enrichment columns.
+Load three CSV files as raw tables in Snowflake — intentionally dirty with duplicates and bad values.
 
 ### Step 1: Update `dbt_project.yml`
 
-Add the `intermediate` block:
+Replace the entire file content with:
 
 ```yaml
+name: 'ecomm_dbt'
+version: '1.0.0'
+config-version: 2
+
+profile: 'ecomm_dbt'
+
+model-paths:    ["models"]
+seed-paths:     ["seeds"]
+test-paths:     ["tests"]
+macro-paths:    ["macros"]
+snapshot-paths: ["snapshots"]
+analysis-paths: ["analyses"]
+
 models:
   ecomm_dbt:
     staging:
       +materialized: view
       +schema: STAGING
-    intermediate:
-      +materialized: view
-      +schema: INTERMEDIATE
-    marts:
+    gold:
       +materialized: table
-      +schema: MARTS
+      +schema: GOLD
+
+seeds:
+  ecomm_dbt:
+    +schema: RAW_DATA
 ```
 
-### Step 2: Create the intermediate model
+### Step 2: Create the seed files
 
-Create `models/intermediate/int_orders_enriched.sql`:
+**`seeds/customers_raw.csv`** — includes duplicate `customer_id=1` and `customer_id=2`, and a row with missing email:
 
-```sql
-SELECT
-    o.order_id,
-    o.customer_id,
-    o.customer_name,
-    o.product,
-    o.quantity,
-    o.unit_price,
-    o.total_amount,
-    o.status,
-    o.order_date,
-    o.updated_at,
-
-    p.category                                              AS product_category,
-    p.stock_quantity                                        AS current_stock,
-    p.is_active                                             AS product_is_active,
-
-    CASE
-        WHEN o.total_amount >= 1000 THEN 'High Value'
-        WHEN o.total_amount >= 300  THEN 'Mid Value'
-        ELSE 'Low Value'
-    END                                                     AS order_value_tier,
-
-    DATEDIFF('day', o.order_date, CURRENT_DATE())           AS days_since_order,
-
-    CASE WHEN o.status = 'CANCELLED' THEN o.total_amount ELSE 0 END  AS cancelled_revenue,
-    CASE WHEN o.status = 'DELIVERED' THEN o.total_amount ELSE 0 END  AS delivered_revenue
-
-FROM {{ ref('stg_orders') }}     o
-LEFT JOIN {{ ref('stg_products') }} p
-    ON LOWER(o.product) = LOWER(p.product_name)
+```csv
+customer_id,customer_name,email,city,country,created_at
+1,Alice Johnson,alice@email.com,New York,US,2024-01-10
+2,Bob Smith,bob@email.com,London,UK,2024-01-15
+3,Carol White,carol@email.com,Sydney,AU,2024-01-20
+4,Dave Brown,dave@email.com,Toronto,CA,2024-02-01
+5,Eve Davis,eve@email.com,New York,US,2024-02-10
+1,Alice Johnson,alice@email.com,New York,US,2024-01-10
+2,Bob Smith,bob_new@email.com,London,UK,2024-01-15
+6,Frank Miller,,Chicago,US,2024-03-01
+7,Grace Wilson,grace@email.com,Berlin,DE,2024-03-15
 ```
 
-### Step 3: Run and verify
+**`seeds/products_raw.csv`** — includes a duplicate `product_id=1` and a negative price:
+
+```csv
+product_id,product_name,category,unit_price,is_active
+1,Laptop Pro,Electronics,1299.99,true
+2,Wireless Mouse,Electronics,29.99,true
+3,Standing Desk,Furniture,599.99,true
+4,USB-C Hub,Electronics,49.99,true
+5,Office Chair,Furniture,399.99,true
+6,Notebook Set,Stationery,12.99,true
+7,Discontinued Item,Gadgets,-5.00,false
+1,Laptop Pro,Electronics,1299.99,true
+```
+
+**`seeds/orders_raw.csv`** — includes a duplicate `order_id=5`, an orphan `customer_id=99`, and a wrong `total_amount`:
+
+```csv
+order_id,customer_id,product_id,quantity,unit_price,total_amount,status,order_date
+1,1,1,1,1299.99,1299.99,DELIVERED,2024-02-01
+2,2,2,3,29.99,89.97,SHIPPED,2024-02-05
+3,3,3,1,599.99,599.99,CONFIRMED,2024-02-10
+4,4,4,2,49.99,99.98,DELIVERED,2024-02-15
+5,5,2,1,29.99,29.99,CANCELLED,2024-02-20
+6,1,5,1,399.99,399.99,SHIPPED,2024-03-01
+7,2,1,1,1299.99,1299.99,CONFIRMED,2024-03-05
+8,3,6,4,12.99,51.96,DELIVERED,2024-03-10
+9,4,2,2,29.99,59.98,SHIPPED,2024-03-15
+10,5,4,1,49.99,49.99,DELIVERED,2024-03-20
+5,5,2,1,29.99,29.99,CANCELLED,2024-02-20
+11,99,1,1,1299.99,1399.99,CONFIRMED,2024-03-25
+```
+
+### Step 3: Load the seeds
 
 ```bash
-dbt run --select int_orders_enriched
+dbt seed
 ```
+
+### Step 4: Verify raw data in Snowflake
 
 ```sql
-SELECT product_category, order_value_tier, days_since_order
-FROM ECOMM_DB.INTERMEDIATE.INT_ORDERS_ENRICHED
-LIMIT 10;
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.CUSTOMERS_RAW;  -- expect 9 (with duplicates)
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.PRODUCTS_RAW;   -- expect 8 (with duplicate)
+SELECT COUNT(*) FROM ECOMM_DB.RAW_DATA.ORDERS_RAW;     -- expect 12 (with duplicate + bad row)
 ```
 
-**Checkpoint:** Rows show `product_category` populated from the join and `order_value_tier` as `'High Value'`, `'Mid Value'`, or `'Low Value'`.
+**Checkpoint:** 9, 8, 12 raw rows respectively. Duplicates are present — that is intentional.
 
 ---
 
-## Exercise 3 — Build the `customer_summary_mart`
+## Exercise 2 — Staging: Deduplication
 
 ### Goal
-Create a mart that aggregates one row per customer using `int_orders_enriched`, and uses `dbt_utils.generate_surrogate_key`.
+Build staging models that deduplicate raw data using `ROW_NUMBER()`.
 
-### Step 1: Create the mart model
+### Step 1: Create `models/staging/stg_customers.sql`
 
-Create `models/marts/customer_summary_mart.sql`:
+```sql
+WITH source AS (
+    SELECT * FROM {{ ref('customers_raw') }}
+),
+
+deduplicated AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id
+            ORDER BY created_at DESC
+        ) AS row_num
+    FROM source
+),
+
+final AS (
+    SELECT
+        customer_id,
+        customer_name,
+        email,
+        city,
+        country,
+        created_at::DATE AS created_date
+    FROM deduplicated
+    WHERE row_num = 1
+)
+
+SELECT * FROM final
+```
+
+### Step 2: Create `models/staging/stg_products.sql`
+
+```sql
+WITH source AS (
+    SELECT * FROM {{ ref('products_raw') }}
+),
+
+deduplicated AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY product_id
+            ORDER BY product_id
+        ) AS row_num
+    FROM source
+),
+
+final AS (
+    SELECT
+        product_id,
+        product_name,
+        category,
+        unit_price,
+        is_active::BOOLEAN AS is_active
+    FROM deduplicated
+    WHERE row_num = 1
+)
+
+SELECT * FROM final
+```
+
+### Step 3: Run and verify deduplication
+
+```bash
+dbt run --select stg_customers stg_products
+```
+
+```sql
+SELECT COUNT(*) FROM ECOMM_DB.STAGING.STG_CUSTOMERS;  -- expect 7 (not 9)
+SELECT COUNT(*) FROM ECOMM_DB.STAGING.STG_PRODUCTS;   -- expect 7 (not 8)
+
+-- Confirm no duplicate customer_ids remain
+SELECT customer_id, COUNT(*) AS cnt
+FROM ECOMM_DB.STAGING.STG_CUSTOMERS
+GROUP BY customer_id
+HAVING cnt > 1;
+-- Expected: 0 rows (no duplicates)
+```
+
+**Checkpoint:** 7 customers, 7 products. `HAVING cnt > 1` returns no rows.
+
+---
+
+## Exercise 3 — Staging: Incremental Model with Dedup
+
+### Goal
+Build `stg_orders` as an incremental model that also deduplicates — combining both patterns.
+
+### Step 1: Create `models/staging/stg_orders.sql`
 
 ```sql
 {{
     config(
-        materialized = 'table',
-        schema       = 'MARTS'
+        materialized = 'incremental',
+        unique_key   = 'order_id'
+    )
+}}
+
+WITH source AS (
+    SELECT * FROM {{ ref('orders_raw') }}
+),
+
+deduplicated AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY order_id
+            ORDER BY order_id
+        ) AS row_num
+    FROM source
+),
+
+final AS (
+    SELECT
+        order_id,
+        customer_id,
+        product_id,
+        quantity,
+        unit_price,
+        total_amount,
+        status,
+        order_date::DATE AS order_date
+    FROM deduplicated
+    WHERE row_num = 1
+)
+
+SELECT * FROM final
+
+{% if is_incremental() %}
+    WHERE order_date > (SELECT MAX(order_date) FROM {{ this }})
+{% endif %}
+```
+
+### Step 2: First run — full load
+
+```bash
+dbt run --select stg_orders
+```
+
+```sql
+SELECT COUNT(*) FROM ECOMM_DB.STAGING.STG_ORDERS;  -- expect 11 (12 minus 1 duplicate)
+```
+
+### Step 3: Simulate incremental — add new orders to the seed
+
+Add these two rows to the bottom of `seeds/orders_raw.csv`:
+
+```csv
+12,1,2,2,29.99,59.98,CONFIRMED,2024-04-01
+13,3,4,1,49.99,49.99,SHIPPED,2024-04-02
+```
+
+Re-seed and re-run:
+
+```bash
+dbt seed
+dbt run --select stg_orders
+```
+
+```sql
+SELECT COUNT(*) FROM ECOMM_DB.STAGING.STG_ORDERS;  -- expect 13 (11 + 2 new)
+SELECT * FROM ECOMM_DB.STAGING.STG_ORDERS WHERE order_date >= '2024-04-01';
+-- expect 2 rows (the newly added orders)
+```
+
+**Checkpoint:** Count goes from 11 to 13. Only the 2 new rows were processed on the second run.
+
+### Step 4: Test `--full-refresh`
+
+```bash
+dbt run --select stg_orders --full-refresh
+```
+
+```sql
+SELECT COUNT(*) FROM ECOMM_DB.STAGING.STG_ORDERS;  -- still 13 — full rebuild same result
+```
+
+**Checkpoint:** Same row count after full refresh confirms the model is correct.
+
+---
+
+## Exercise 4 — Data Quality Tests
+
+### Goal
+Add generic tests via `schema.yml` and three business-level singular tests.
+
+### Step 1: Create the custom generic test macro
+
+Create `macros/test_not_negative.sql`:
+
+```sql
+{% test not_negative(model, column_name) %}
+
+SELECT {{ column_name }}
+FROM {{ model }}
+WHERE {{ column_name }} < 0
+
+{% endtest %}
+```
+
+### Step 2: Create `models/staging/schema.yml`
+
+```yaml
+version: 2
+
+models:
+  - name: stg_customers
+    description: "Deduplicated customers. One row per customer_id."
+    columns:
+      - name: customer_id
+        tests:
+          - not_null
+          - unique
+      - name: customer_name
+        tests:
+          - not_null
+      - name: country
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['US', 'UK', 'AU', 'CA', 'DE']
+
+  - name: stg_products
+    description: "Deduplicated products. One row per product_id."
+    columns:
+      - name: product_id
+        tests:
+          - not_null
+          - unique
+      - name: product_name
+        tests:
+          - not_null
+      - name: unit_price
+        tests:
+          - not_null
+          - not_negative
+      - name: category
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['Electronics', 'Furniture', 'Stationery', 'Gadgets']
+
+  - name: stg_orders
+    description: "Deduplicated incremental orders. One row per order_id."
+    columns:
+      - name: order_id
+        tests:
+          - not_null
+          - unique
+      - name: customer_id
+        tests:
+          - not_null
+      - name: quantity
+        tests:
+          - not_null
+          - not_negative
+      - name: total_amount
+        tests:
+          - not_null
+          - not_negative
+      - name: status
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['CONFIRMED', 'SHIPPED', 'DELIVERED', 'CANCELLED']
+```
+
+### Step 3: Create three singular tests
+
+**`tests/assert_order_amount_matches_quantity_x_price.sql`**
+
+```sql
+SELECT
+    order_id,
+    quantity,
+    unit_price,
+    total_amount,
+    ROUND(quantity * unit_price, 2) AS expected_amount
+FROM {{ ref('stg_orders') }}
+WHERE ABS(total_amount - ROUND(quantity * unit_price, 2)) > 0.01
+```
+
+**`tests/assert_no_future_order_dates.sql`**
+
+```sql
+SELECT
+    order_id,
+    order_date,
+    CURRENT_DATE() AS today
+FROM {{ ref('stg_orders') }}
+WHERE order_date > CURRENT_DATE()
+```
+
+**`tests/assert_customer_exists_for_order.sql`**
+
+```sql
+SELECT
+    o.order_id,
+    o.customer_id
+FROM {{ ref('stg_orders') }} o
+WHERE o.customer_id NOT IN (
+    SELECT customer_id FROM {{ ref('stg_customers') }}
+)
+```
+
+### Step 4: Run all staging tests
+
+```bash
+dbt test --select staging
+```
+
+**Expected output — 3 intentional failures:**
+
+```
+FAIL  not_negative_stg_products_unit_price
+FAIL  assert_order_amount_matches_quantity_x_price
+FAIL  assert_customer_exists_for_order
+```
+
+These failures are expected. They prove the tests work. All other tests pass.
+
+**Checkpoint:** Exactly 3 failures. All related to the intentional dirty data in the seeds.
+
+---
+
+## Exercise 5 — SCD Type 2 Snapshot
+
+### Goal
+Capture customer address history. Simulate an address change and verify two versions exist in the snapshot.
+
+### Step 1: Create `snapshots/customers_snapshot.sql`
+
+```sql
+{% snapshot customers_snapshot %}
+
+{{
+    config(
+        target_schema = 'SNAPSHOTS',
+        unique_key    = 'customer_id',
+        strategy      = 'check',
+        check_cols    = ['city', 'country', 'email']
     )
 }}
 
 SELECT
     customer_id,
     customer_name,
-    COUNT(DISTINCT order_id)                                AS total_orders,
-    MIN(order_date)                                         AS first_order_date,
-    MAX(order_date)                                         AS latest_order_date,
-    SUM(total_amount)                                       AS lifetime_value,
-    AVG(total_amount)                                       AS avg_order_value,
-    SUM(delivered_revenue)                                  AS delivered_revenue,
-    SUM(cancelled_revenue)                                  AS cancelled_revenue,
-    COUNT(DISTINCT CASE WHEN status = 'CANCELLED'
-                   THEN order_id END)                       AS cancelled_orders,
-    ROUND(
-        COUNT(DISTINCT CASE WHEN status = 'CANCELLED'
-                       THEN order_id END) * 100.0
-        / NULLIF(COUNT(DISTINCT order_id), 0),
-    2)                                                      AS cancellation_rate_pct,
-    {{ dbt_utils.generate_surrogate_key(['customer_id']) }} AS customer_key
-FROM {{ ref('int_orders_enriched') }}
-GROUP BY customer_id, customer_name
+    email,
+    city,
+    country,
+    created_date
+FROM {{ ref('stg_customers') }}
+
+{% endsnapshot %}
 ```
 
-### Step 2: Run and verify
+### Step 2: Run snapshot for the first time
 
 ```bash
-dbt run --select customer_summary_mart
+dbt snapshot
 ```
 
 ```sql
-SELECT customer_name, total_orders, lifetime_value, cancellation_rate_pct, customer_key
-FROM ECOMM_DB.MARTS.CUSTOMER_SUMMARY_MART
-ORDER BY lifetime_value DESC;
+-- All 7 customers, all current (dbt_valid_to = NULL)
+SELECT customer_id, customer_name, city, dbt_valid_from, dbt_valid_to
+FROM ECOMM_DB.SNAPSHOTS.CUSTOMERS_SNAPSHOT
+ORDER BY customer_id;
 ```
 
-**Checkpoint:** `customer_key` is a 32-character hex string (MD5 hash). `cancellation_rate_pct` is a number between 0 and 100.
+**Checkpoint:** 7 rows, all with `dbt_valid_to = NULL`.
 
----
+### Step 3: Simulate an address change
 
-## Exercise 4 — Build the `employees_mart` (Self-Join)
-
-### Goal
-Create a mart that joins `stg_employees` to itself to look up each employee's manager, and uses a window function for ranking.
-
-### Step 1: Create the mart model
-
-Create `models/marts/employees_mart.sql`:
-
-```sql
-{{
-    config(
-        materialized = 'table',
-        schema       = 'MARTS'
-    )
-}}
-
-SELECT
-    e.employee_id,
-    e.employee_name,
-    e.department,
-    e.salary,
-    e.status,
-
-    m.employee_name                                             AS manager_name,
-    m.department                                                AS manager_department,
-
-    CASE
-        WHEN e.salary >= 90000 THEN 'Senior Band'
-        WHEN e.salary >= 70000 THEN 'Mid Band'
-        ELSE 'Junior Band'
-    END                                                         AS salary_band,
-
-    e.salary - AVG(e.salary) OVER (
-        PARTITION BY e.department
-    )                                                           AS salary_vs_dept_avg,
-
-    RANK() OVER (
-        PARTITION BY e.department
-        ORDER BY e.salary DESC
-    )                                                           AS salary_rank_in_dept,
-
-    {{ dbt_utils.generate_surrogate_key(['e.employee_id']) }}  AS employee_key
-
-FROM {{ ref('stg_employees') }} e
-LEFT JOIN {{ ref('stg_employees') }} m
-    ON e.manager_id = m.employee_id
-```
-
-### Step 2: Run and verify
-
-```bash
-dbt run --select employees_mart
-```
-
-```sql
-SELECT employee_name, department, salary_band, manager_name, salary_rank_in_dept,
-       ROUND(salary_vs_dept_avg, 2) AS vs_dept_avg
-FROM ECOMM_DB.MARTS.EMPLOYEES_MART
-ORDER BY department, salary_rank_in_dept;
-```
-
-**Checkpoint:** `manager_name` is NULL for department heads (employees with no `manager_id`). `salary_rank_in_dept = 1` is the highest earner per department.
-
----
-
-## Exercise 5 — Create a Date Spine
-
-### Goal
-Build a date dimension table using `dbt_utils.date_spine` that covers all of 2024.
-
-### Step 1: Create the model
-
-Create `models/marts/date_spine_mart.sql`:
-
-```sql
-{{
-    config(
-        materialized = 'table',
-        schema       = 'MARTS'
-    )
-}}
-
-WITH date_spine AS (
-    {{ dbt_utils.date_spine(
-        datepart   = "day",
-        start_date = "cast('2024-01-01' as date)",
-        end_date   = "cast('2024-12-31' as date)"
-    ) }}
-)
-
-SELECT
-    date_day                                                  AS calendar_date,
-    YEAR(date_day)                                            AS year,
-    MONTH(date_day)                                           AS month,
-    DAY(date_day)                                             AS day_of_month,
-    DAYOFWEEK(date_day)                                       AS day_of_week,
-    CASE WHEN DAYOFWEEK(date_day) IN (0, 6)
-         THEN FALSE ELSE TRUE END                             AS is_weekday,
-    MONTHNAME(date_day)                                       AS month_name,
-    DAYNAME(date_day)                                         AS day_name
-FROM date_spine
-```
-
-### Step 2: Run and verify
-
-```bash
-dbt run --select date_spine_mart
-```
-
-```sql
-SELECT COUNT(*) FROM ECOMM_DB.MARTS.DATE_SPINE_MART;
--- Expected: 365 (2024 is a leap year — verify it's 366)
-
-SELECT * FROM ECOMM_DB.MARTS.DATE_SPINE_MART
-WHERE is_weekday = FALSE
-LIMIT 5;
--- Expected: weekend dates
-```
-
-**Checkpoint:** 365 or 366 rows (2024 is a leap year — 366 is correct). Weekend rows have `is_weekday = FALSE`.
-
----
-
-## Exercise 6 — Write Two Analyses
-
-### Goal
-Create analysis files for ad-hoc queries that use `ref()` but should not be materialized.
-
-### Analysis 1 — Revenue by product category
-
-Create `analyses/revenue_by_category.sql`:
-
-```sql
-SELECT
-    p.category,
-    COUNT(DISTINCT o.order_id)                              AS total_orders,
-    SUM(o.total_amount)                                     AS total_revenue,
-    AVG(o.total_amount)                                     AS avg_order_value,
-    ROUND(
-        SUM(o.total_amount) * 100.0
-        / SUM(SUM(o.total_amount)) OVER (),
-    2)                                                      AS revenue_share_pct
-FROM {{ ref('int_orders_enriched') }} o
-JOIN {{ ref('stg_products') }}        p
-    ON LOWER(o.product) = LOWER(p.product_name)
-GROUP BY p.category
-ORDER BY total_revenue DESC
-```
-
-### Analysis 2 — Headcount by department
-
-Create `analyses/employee_headcount_by_department.sql`:
-
-```sql
-SELECT
-    department,
-    COUNT(*)                                                AS headcount,
-    ROUND(AVG(salary), 2)                                   AS avg_salary,
-    SUM(salary)                                             AS total_salary_cost,
-    ROUND(AVG(salary) - AVG(AVG(salary)) OVER (), 2)        AS salary_vs_company_avg
-FROM {{ ref('stg_employees') }}
-WHERE status = 'active'
-GROUP BY department
-ORDER BY headcount DESC
-```
-
-### Step 3: Compile and run manually
-
-```bash
-dbt compile --select revenue_by_category
-```
-
-Open the compiled file from:
-```
-target/compiled/ecomm_dbt/analyses/revenue_by_category.sql
-```
-
-Copy the SQL, paste it into Snowsight, and run it.
-
-**Checkpoint:** Compiled SQL has no Jinja — only raw Snowflake SQL with fully-qualified table paths. Running it in Snowsight returns revenue grouped by Electronics, Furniture, etc.
-
----
-
-## Exercise 7 — Declare Exposures
-
-### Goal
-Add two exposures to represent downstream consumers of the mart models.
-
-### Create `models/exposures.yml`
-
-```yaml
-version: 2
-
-exposures:
-
-  - name: revenue_dashboard
-    type: dashboard
-    maturity: high
-    description: >
-      Executive revenue dashboard. Shows total revenue, orders by status,
-      and top customers by lifetime value. Updated daily.
-    owner:
-      name: Data Analytics Team
-      email: analytics@company.com
-    depends_on:
-      - ref('orders_mart')
-      - ref('customer_summary_mart')
-
-  - name: inventory_report
-    type: dashboard
-    maturity: medium
-    description: >
-      Product inventory and stock health report used by the Supply Chain team.
-    owner:
-      name: Supply Chain Team
-      email: supply@company.com
-    depends_on:
-      - ref('products_mart')
-
-  - name: customer_churn_ml_pipeline
-    type: ml
-    maturity: low
-    description: >
-      ML pipeline that scores customer churn probability.
-      Uses lifetime_value and cancellation_rate_pct as features.
-    owner:
-      name: ML Engineering Team
-      email: ml@company.com
-    depends_on:
-      - ref('customer_summary_mart')
-```
-
-### Verify exposures appear in the docs
-
-```bash
-dbt docs generate
-dbt docs serve
-```
-
-In the lineage graph, click `customer_summary_mart` — you should see orange exposure nodes downstream of it.
-
-**Checkpoint:** `revenue_dashboard` and `customer_churn_ml_pipeline` appear as orange nodes in the lineage graph. `inventory_report` appears downstream of `products_mart`.
-
----
-
-## Exercise 8 — Run `dbt build` End-to-End
-
-### Goal
-Run the complete project — seeds, models, tests — in one command and observe topological ordering.
-
-### Step 1: Full build
-
-```bash
-dbt build
-```
-
-Watch the output: seeds run first, then staging models + their tests, then intermediate + its tests, then marts + their tests.
-
-**Checkpoint:** `FAIL=0 ERROR=0 SKIP=0` in the final output.
-
-### Step 2: Understand node selection
-
-Run only the downstream pipeline from `int_orders_enriched`:
-
-```bash
-dbt build --select int_orders_enriched+
-```
-
-Verify only `int_orders_enriched`, `customer_summary_mart`, and their tests ran (not `stg_orders` or `stg_products` — those are upstream).
-
-### Step 3: Break a test and observe the cascade
-
-Add a row to `seeds/products.csv` with a negative price:
+In `seeds/customers_raw.csv`, change Alice (customer_id=1) from `New York` to `Los Angeles`:
 
 ```csv
-13,Broken Product,Gadgets,-5.00,10,true
+1,Alice Johnson,alice@email.com,Los Angeles,US,2024-01-10
 ```
 
-Run:
-```bash
-dbt seed
-dbt build --select stg_products+
-```
-
-Expected: `stg_products` builds, the `assert_product_price_is_positive` singular test FAILS, and `products_mart` is SKIPPED.
-
-Restore: remove row 13 from `products.csv` and re-seed:
+Re-seed, re-run staging, re-snapshot:
 
 ```bash
 dbt seed
-dbt build --select stg_products+
+dbt run --select stg_customers
+dbt snapshot
 ```
 
-**Checkpoint:** After restoring, `FAIL=0 SKIP=0`.
+### Step 4: Verify SCD Type 2 history
+
+```sql
+-- Alice should have 2 rows now
+SELECT customer_id, customer_name, city, dbt_valid_from, dbt_valid_to
+FROM ECOMM_DB.SNAPSHOTS.CUSTOMERS_SNAPSHOT
+WHERE customer_id = 1
+ORDER BY dbt_valid_from;
+```
+
+Expected:
+```
+customer_id  city          dbt_valid_from   dbt_valid_to
+1            New York      <first run time> <second run time>  ← closed
+1            Los Angeles   <second run time> NULL              ← current
+```
+
+```sql
+-- All other customers: still 1 row each
+SELECT customer_id, COUNT(*) AS versions
+FROM ECOMM_DB.SNAPSHOTS.CUSTOMERS_SNAPSHOT
+GROUP BY customer_id
+ORDER BY customer_id;
+-- Expected: customer_id=1 has 2, all others have 1
+```
+
+**Checkpoint:** `customer_id=1` has 2 versions. Total snapshot rows = 8 (7 original + 1 new version for Alice).
 
 ---
 
-## Exercise 9 — Add Tests to Mart `schema.yml`
+## Exercise 6 — Gold Layer: Dimension and Fact Tables
 
 ### Goal
-Add tests to the new mart models so `dbt build` validates them automatically.
+Build `dim_customers`, `dim_products`, and `fct_orders` using surrogate keys and explicit WHERE clauses to filter bad data.
 
-### Update `models/marts/schema.yml`
+### Step 1: Create the `gold/` folder
 
-Add entries for `customer_summary_mart` and `employees_mart`:
+Create `models/gold/` directory. Add these three models:
+
+**`models/gold/dim_customers.sql`**
+
+```sql
+{{
+    config(
+        materialized = 'table',
+        schema       = 'GOLD'
+    )
+}}
+
+SELECT
+    MD5(CAST(customer_id AS VARCHAR))   AS customer_key,
+    customer_id,
+    customer_name,
+    email,
+    city,
+    country,
+    created_date
+FROM {{ ref('customers_snapshot') }}
+WHERE dbt_valid_to IS NULL
+```
+
+**`models/gold/dim_products.sql`**
+
+```sql
+{{
+    config(
+        materialized = 'table',
+        schema       = 'GOLD'
+    )
+}}
+
+SELECT
+    MD5(CAST(product_id AS VARCHAR))    AS product_key,
+    product_id,
+    product_name,
+    category,
+    unit_price,
+    is_active,
+    CASE
+        WHEN unit_price < 50    THEN 'Budget'
+        WHEN unit_price < 300   THEN 'Mid-range'
+        WHEN unit_price < 1000  THEN 'Premium'
+        ELSE 'Enterprise'
+    END                                 AS price_tier
+FROM {{ ref('stg_products') }}
+WHERE unit_price > 0
+  AND is_active = TRUE
+```
+
+**`models/gold/fct_orders.sql`**
+
+```sql
+{{
+    config(
+        materialized = 'table',
+        schema       = 'GOLD'
+    )
+}}
+
+SELECT
+    o.order_id,
+    MD5(CAST(o.customer_id AS VARCHAR)) AS customer_key,
+    MD5(CAST(o.product_id  AS VARCHAR)) AS product_key,
+
+    o.quantity,
+    o.unit_price,
+    o.total_amount,
+    o.status,
+    o.order_date,
+
+    CASE WHEN o.status = 'DELIVERED' THEN o.total_amount ELSE 0 END AS delivered_revenue,
+    CASE WHEN o.status = 'CANCELLED' THEN o.total_amount ELSE 0 END AS cancelled_revenue
+
+FROM {{ ref('stg_orders') }} o
+
+WHERE
+    o.customer_id IN (SELECT customer_id FROM {{ ref('stg_customers') }})
+    AND ABS(o.total_amount - ROUND(o.quantity * o.unit_price, 2)) <= 0.01
+```
+
+### Step 2: Add `models/gold/schema.yml`
 
 ```yaml
 version: 2
 
 models:
-  - name: orders_mart
-    description: "Daily order summary. One row per order_date."
+  - name: dim_customers
+    description: "Current state of every customer. One row per customer_id."
     columns:
-      - name: order_date
-        tests: [not_null, unique]
-      - name: total_orders
-        tests: [not_null]
-      - name: total_revenue
-        tests: [not_null]
-
-  - name: customer_summary_mart
-    description: "One row per customer with lifetime order metrics."
-    columns:
-      - name: customer_id
-        tests: [not_null, unique]
       - name: customer_key
         tests: [not_null, unique]
-      - name: lifetime_value
+      - name: customer_id
+        tests: [not_null, unique]
+      - name: customer_name
         tests: [not_null]
 
-  - name: employees_mart
-    description: "Employee directory with manager lookup and salary band."
+  - name: dim_products
+    description: "Active products with valid price. Excludes inactive and negative-price rows."
     columns:
-      - name: employee_id
-        tests: [not_null, unique]
-      - name: employee_key
-        tests: [not_null, unique]
-      - name: salary_band
-        tests:
-          - not_null
-          - accepted_values:
-              values: ['Junior Band', 'Mid Band', 'Senior Band']
-
-  - name: products_mart
-    description: "Product catalogue enriched with price tiers and rankings."
-    columns:
-      - name: product_id
-        tests: [not_null, unique]
       - name: product_key
+        tests: [not_null, unique]
+      - name: product_id
         tests: [not_null, unique]
       - name: price_tier
         tests:
           - not_null
           - accepted_values:
               values: ['Budget', 'Mid-range', 'Premium', 'Enterprise']
+
+  - name: fct_orders
+    description: "One row per valid order. Orphan FK and amount-mismatch rows excluded."
+    columns:
+      - name: order_id
+        tests: [not_null, unique]
+      - name: customer_key
+        tests: [not_null]
+      - name: product_key
+        tests: [not_null]
+      - name: total_amount
+        tests: [not_null, not_negative]
+      - name: status
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['CONFIRMED', 'SHIPPED', 'DELIVERED', 'CANCELLED']
 ```
 
-### Run tests only on marts
+### Step 3: Run the gold layer
 
 ```bash
-dbt test --select marts
+dbt run --select gold
+dbt test --select gold
 ```
 
-**Checkpoint:** All mart tests pass. If `accepted_values` on `price_tier` fails, check the values your `classify_price` macro produces against the list you declared.
+**Expected: all gold tests PASS** — the bad rows were filtered by the WHERE clauses.
+
+### Step 4: Verify gold layer counts
+
+```sql
+-- 7 customers (all current)
+SELECT COUNT(*) FROM ECOMM_DB.GOLD.DIM_CUSTOMERS;
+
+-- 6 products (product_id=7 excluded: negative price + inactive)
+SELECT COUNT(*) FROM ECOMM_DB.GOLD.DIM_PRODUCTS;
+
+-- 12 valid orders (order_id=11 excluded: orphan FK + wrong amount)
+SELECT COUNT(*) FROM ECOMM_DB.GOLD.FCT_ORDERS;
+```
+
+**Checkpoint:** 7 / 6 / 12. The one bad order (`order_id=11`) is excluded from the fact table.
 
 ---
 
-## Final Verification
+## Exercise 7 — Full `dbt build`
+
+### Goal
+Run the entire pipeline in one command and observe topological ordering.
 
 ```bash
 dbt build
 ```
 
-Expected final output:
+### What to observe
+
+Watch the output — things run in this order:
+1. Seeds load
+2. Staging models build (views)
+3. Staging tests run — 3 intentional failures appear
+4. Snapshot runs
+5. Gold models build (tables)
+6. Gold tests run — all pass
+
+### Expected final summary
+
 ```
-Done. PASS=N WARN=0 ERROR=0 FAIL=0 SKIP=0 TOTAL=N
+Done. PASS=N WARN=0 ERROR=0 FAIL=3 SKIP=0 TOTAL=N
 ```
 
-Verify all new objects exist in Snowflake:
+The 3 failures are the intentional staging tests. All gold tests pass because the bad rows were filtered out.
+
+---
+
+## Exercise 8 — The Star Schema Query
+
+### Goal
+Write the final BI-layer query that joins all three gold tables — the query that Tableau, Power BI, or any analytics tool would run.
 
 ```sql
-SHOW VIEWS  IN SCHEMA ECOMM_DB.INTERMEDIATE;
-SHOW TABLES IN SCHEMA ECOMM_DB.MARTS;
+SELECT
+    f.order_id,
+    c.customer_name,
+    c.city,
+    c.country,
+    p.product_name,
+    p.category,
+    p.price_tier,
+    f.quantity,
+    f.total_amount,
+    f.status,
+    f.order_date,
+    f.delivered_revenue,
+    f.cancelled_revenue
+FROM ECOMM_DB.GOLD.FCT_ORDERS       f
+JOIN ECOMM_DB.GOLD.DIM_CUSTOMERS    c ON f.customer_key = c.customer_key
+JOIN ECOMM_DB.GOLD.DIM_PRODUCTS     p ON f.product_key  = p.product_key
+ORDER BY f.order_date;
 ```
 
-Expected marts: `ORDERS_MART`, `PRODUCTS_MART`, `CUSTOMER_SUMMARY_MART`, `EMPLOYEES_MART`, `DATE_SPINE_MART`, `ORDERS_BY_CATEGORY_PIVOT`.
+Run this in Snowsight.
+
+**Checkpoint:** Every order row is enriched with the customer name, city, product name, and category. No `customer_id=99` row appears (filtered out). No bad amount row appears (filtered out).
 
 ---
 
 ## Stretch Goals
 
-1. **Dynamic pivot** — Replace the hardcoded product list in `orders_by_category_pivot.sql` with `dbt_utils.get_column_values` so it always covers all products without manual updates.
+1. **Point-in-time query** — Write a query against `CUSTOMERS_SNAPSHOT` that shows Alice's city at the time each of her orders was placed. Join `FCT_ORDERS` to `CUSTOMERS_SNAPSHOT` using `dbt_valid_from` and `dbt_valid_to` date range logic.
 
-2. **Tag-based selection** — Add `+tags: ["daily"]` to the staging and marts layers in `dbt_project.yml`. Run `dbt build --select tag:daily` and confirm only tagged models run.
+2. **Revenue summary by category** — Write a query on the gold layer that shows total delivered revenue and total cancelled revenue grouped by `p.category`.
 
-3. **Dynamic date spine** — Update `date_spine_mart.sql` so `end_date` always equals today using `modules.datetime.date.today()` in Jinja, eliminating the hardcoded `2024-12-31`.
+3. **Fix the bad seed data** — Remove `order_id=11` from `orders_raw.csv`, remove the negative price from `products_raw.csv`. Re-seed and re-run. Confirm all staging tests now pass and `fct_orders` has 14 rows (12 original valid + 2 added in Exercise 3).
 
-4. **Exposure-driven audit** — Add a fourth exposure for `employees_mart` owned by HR. Run `dbt docs generate` and confirm all four exposures appear in the lineage graph with their correct upstream dependencies.
+4. **Add a `dbt_valid_from` column to `fct_orders`** — Join `fct_orders` to `customers_snapshot` (not `dim_customers`) using the order date to bring in the city the customer was in at the time of the order. This is the proper historical join — not the current city from the dimension.

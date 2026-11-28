@@ -1,196 +1,257 @@
-# Day 4 — Interview Solutions: Packages, Exposures, Analyses, and Advanced Mart Modeling
+# Day 4 — Interview Solutions: Dedup, Incremental, Data Quality, SCD Type 2, and Gold Layer
 
 ---
 
-**A1** — A dbt package is a collection of macros, models, and tests published to [hub.getdbt.com](https://hub.getdbt.com). You declare packages in `packages.yml` at the root of your dbt project, then run `dbt deps` to download them into `dbt_packages/`. Never commit `dbt_packages/` to git.
+**A1** — Deduplication is the process of removing duplicate rows so that each business entity (customer, product, order) appears exactly once. It belongs in the staging layer — not the gold layer — because:
 
-```yaml
-# packages.yml
-packages:
-  - package: dbt-labs/dbt_utils
-    version: 1.3.0
-```
-
-```bash
-dbt deps
-```
+1. **Catch it early.** Every downstream model that reads staging inherits clean data automatically. If you deduplicate in gold, you have to remember to do it in every gold model.
+2. **Single responsibility.** Staging's job is to clean and normalize raw data. Gold's job is to apply business logic and aggregate. Mixing concerns makes models harder to debug.
+3. **Tests run on staging.** `unique` tests on `stg_customers.customer_id` will fail if deduplication is missing, alerting you immediately.
 
 ---
 
-**A2** — dbt-utils is a utility package maintained by dbt Labs (the company that created dbt). Three commonly-used macros:
-
-| Macro | What it does |
-|---|---|
-| `dbt_utils.generate_surrogate_key(['col1', 'col2'])` | Hashes a list of columns into a stable surrogate key, adapter-aware |
-| `dbt_utils.date_spine(datepart, start_date, end_date)` | Generates a table of consecutive dates between two boundaries |
-| `dbt_utils.pivot(column, values, agg, then_value)` | Converts distinct row values into columns using conditional aggregation |
-
----
-
-**A3** — Both produce a surrogate key by hashing columns. The difference:
-
-| | Custom macro (Day 3) | `dbt_utils.generate_surrogate_key` |
-|---|---|---|
-| Hash function | Always `MD5` (Snowflake-specific) | Adapter-aware — `MD5` on Snowflake, `FARM_FINGERPRINT` on BigQuery |
-| Maintained by | You | dbt Labs |
-| Versioned | Only via git | Pinned in `packages.yml` |
-
-Prefer `dbt_utils` for the surrogate key because it is adapter-portable. Keep custom macros (`classify_price`, `cents_to_dollars`) for business-specific logic that no community package covers.
-
----
-
-**A4** — An analysis is a `.sql` file inside the `analyses/` folder. It is compiled by dbt (Jinja is evaluated, `ref()` works) but is **never materialized** — dbt does not create any Snowflake object for it. It is for ad-hoc, investigative, or one-off queries you want to version-control alongside your models. A model in `models/` creates a table, view, or incremental table; an analysis creates nothing.
-
----
-
-**A5** — You run:
-
-```bash
-dbt compile --select revenue_by_category
-```
-
-The compiled SQL is written to:
-```
-target/compiled/ecomm_dbt/analyses/revenue_by_category.sql
-```
-
-All `ref()` calls are replaced with their fully-qualified Snowflake paths. You copy this file and paste it into Snowsight to run it. `dbt compile` does not execute any SQL against Snowflake.
-
----
-
-**A6** — An exposure declares a **downstream consumer** of your dbt models — a BI dashboard, an ML pipeline, an API, or a notebook. It creates no Snowflake objects; it is metadata only. In `dbt docs serve`, exposures appear as **orange nodes** in the lineage graph, downstream of the mart models they depend on. Clicking an exposure shows its description, owner, URL, and which models it reads from.
-
----
-
-**A7** — Valid exposure types and real-world examples:
-
-| Type | Example |
-|---|---|
-| `dashboard` | A Tableau / Metabase revenue dashboard reading from `orders_mart` |
-| `notebook` | A Jupyter notebook for exploratory data analysis on `customer_summary_mart` |
-| `analysis` | A monthly headcount report run from `analyses/employee_headcount_by_department.sql` |
-| `ml` | A churn prediction pipeline that reads `cancellation_rate_pct` from `customer_summary_mart` |
-| `application` | A product feature that calls `products_mart` directly for inventory display |
-
----
-
-**A8** — `dbt build` combines seed + run + test + snapshot into one **topologically-ordered** execution. The critical difference: with `dbt build`, tests run **immediately after their model is built** — if `stg_orders` tests fail, `int_orders_enriched` is SKIPPED before it even starts. With separate `dbt run` then `dbt test`, ALL models run first (including `int_orders_enriched`), and THEN tests run. Failed data can propagate downstream before tests catch it.
-
----
-
-**A9** — With `dbt build`: `customer_summary_mart` is **SKIPPED**. dbt sees that `int_orders_enriched` failed its tests, marks all downstream nodes as errored/skipped, and does not run them. The final output shows `SKIP=1` for `customer_summary_mart`.
-
-With separate `dbt run` + `dbt test`: `customer_summary_mart` **runs and builds successfully** even though `int_orders_enriched` has bad data — because `dbt run` does not check test results. Only when `dbt test` runs afterward do you see the `int_orders_enriched` failure, but by then `customer_summary_mart` already contains corrupted data.
-
-This is why `dbt build` is the correct production pattern.
-
----
-
-**A10** —
-
-| Selector | Meaning | Use when |
-|---|---|---|
-| `+model` | All **upstream** ancestors of this model | You want to trace the root cause — rebuild everything that feeds into a broken model |
-| `model+` | This model AND all its **downstream** dependents | You changed a staging model and want to cascade the rebuild through all its consumers |
-| `+model+` | All upstream AND all downstream | Full end-to-end rebuild of an entire pipeline branch |
-
----
-
-**A11** —
-
-```bash
-dbt build --select int_orders_enriched+
-```
-
-The `+` after the model name means "this model and all downstream nodes". dbt builds `int_orders_enriched`, then all models that depend on it (`customer_summary_mart`, etc.), in topological order, running tests after each.
-
----
-
-**A12** — The intermediate layer is where **joins, enrichments, and row-level transformations** happen — logic that is too complex for staging (which should be clean, one-to-one with the source) but too granular for marts (which should be clean aggregations). The `int_` prefix is a naming convention that signals "this is not for end consumers — only mart models should ref this".
-
-Intermediate models should use `materialized='view'` (or `ephemeral`). They are stepping stones, not end-products — materializing them as tables wastes storage and adds rebuild time for data no BI tool reads directly.
-
----
-
-**A13** — No, dbt does not throw a circular dependency error. A self-join references the same model twice as two different **aliases** (`e` and `m`). dbt's DAG has only one node for `stg_employees`, and `employees_mart` depends on it once. The two `ref()` calls both resolve to the same node — there is no cycle.
-
-A circular dependency would require model A to `ref()` model B while model B `ref()`s model A — that is impossible here since both references point to the same model, and that model does not reference `employees_mart`.
-
----
-
-**A14** — `dbt_utils.get_column_values` runs at **compile time** (`dbt compile` or the compile phase of `dbt run`), not at execution time. It issues a `SELECT DISTINCT` query against Snowflake to fetch the column values before any models are run.
-
-The implication: if `stg_orders` has not been built yet (first run on a fresh Snowflake environment), `get_column_values` fails because the table does not exist. The fix is to run `dbt run --select stg_orders` first, or use a hardcoded list for the first run, then switch to `get_column_values` afterward.
-
----
-
-**A15** — They get a macro not found error like:
-```
-Compilation Error in model products_mart (models/marts/products_mart.sql)
-  'dbt_utils' is undefined
-```
-
-To prevent this in CI: add `dbt deps` as a step **before** `dbt build` in your pipeline:
-
-```yaml
-# GitHub Actions example
-- name: Install dbt packages
-  run: dbt deps
-
-- name: Build dbt project
-  run: dbt build
-```
-
----
-
-**A16** — `state:modified+` selects only models whose SQL or config has changed since the last successful run, plus all their downstream dependents. It requires a `manifest.json` from the last run to exist (usually downloaded as a CI artifact from the previous successful pipeline run).
-
-Use it in pull request CI pipelines to avoid rebuilding the entire project on every PR — only the changed models and their downstream impact are tested:
-
-```bash
-dbt build --select state:modified+
-```
-
-This makes CI dramatically faster on large projects. Without it, every PR rebuilds everything even if only one staging model changed.
-
----
-
-**A17** — The exposure in `exposures.yml` does not automatically detect column renames. What it does is make the **blast radius visible in the lineage graph**: anyone who opens `dbt docs serve` can see that `customer_summary_mart` has a downstream consumer (`revenue_dashboard`) with `maturity: high`. This signals that the rename needs to be coordinated with the BI team before merging.
-
-Best practice: before renaming a column in a mart that has a `high` maturity exposure, check the exposure's `owner.email` and notify them. Some teams add a CI check that fails if a mart column referenced in an exposure YAML is renamed without updating the exposure description.
-
----
-
-**A18** — Use Jinja's `run_query` or simply use Snowflake's `CURRENT_DATE()` inside the macro call with string formatting:
+**A2** — The standard deduplication pattern:
 
 ```sql
-{{
-    config(
-        materialized = 'table',
-        schema       = 'MARTS'
-    )
-}}
-
-WITH date_spine AS (
-    {{ dbt_utils.date_spine(
-        datepart   = "day",
-        start_date = "cast('2024-01-01' as date)",
-        end_date   = "cast('" ~ modules.datetime.date.today().strftime('%Y-%m-%d') ~ "' as date)"
-    ) }}
+WITH deduplicated AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id    -- group all rows with the same business key
+            ORDER BY created_at DESC    -- most recent row wins (row_num = 1)
+        ) AS row_num
+    FROM source
 )
-
-SELECT date_day AS calendar_date
-FROM date_spine
+SELECT * FROM deduplicated WHERE row_num = 1
 ```
 
-`modules.datetime` is available in dbt's Jinja context and gives you the current date at compile time. Alternatively, for Snowflake specifically, `end_date = "current_date()"` works directly in the date_spine macro because it passes the expression as raw SQL:
+- `PARTITION BY customer_id` — resets the row counter for each unique `customer_id`
+- `ORDER BY created_at DESC` — the tiebreaker determines which duplicate is "best". Descending puts the most recent row first (row_num = 1). For exact duplicates with no reliable tiebreaker, any `ORDER BY` column works since all rows are identical anyway
+- `WHERE row_num = 1` — keeps exactly one row per `customer_id` — the one ranked first
+
+---
+
+**A3** — An incremental model builds a table that grows over time by processing only new rows, rather than rebuilding the entire table from scratch on every run.
+
+- **First run:** dbt creates the table with ALL rows (no incremental filter applied — `is_incremental()` returns FALSE)
+- **Subsequent runs:** dbt only fetches rows newer than what is already in the table, then INSERTs or MERGEs them in (`is_incremental()` returns TRUE, the WHERE block is applied)
+
+`unique_key = 'order_id'` controls what happens when a row already exists in the table:
+- **Without `unique_key`:** dbt always INSERTs — duplicates accumulate
+- **With `unique_key`:** dbt generates a MERGE — if `order_id` already exists, UPDATE the row; if it is new, INSERT it
+
+---
+
+**A4** — The existing order row (`order_id=X, status=CONFIRMED`) is already in `stg_orders`. On the next run:
+
+1. The source returns the row again with `status=SHIPPED` and a newer `updated_at`
+2. The incremental WHERE filter passes it through (it is "new" relative to the max date)
+3. Because `unique_key = 'order_id'` is set, dbt generates a MERGE statement:
 
 ```sql
-{{ dbt_utils.date_spine(
-    datepart   = "day",
-    start_date = "cast('2024-01-01' as date)",
-    end_date   = "current_date()"
-) }}
+MERGE INTO stg_orders AS target
+USING (SELECT ... WHERE order_date > ...) AS source
+ON target.order_id = source.order_id
+WHEN MATCHED THEN UPDATE SET status = 'SHIPPED', ...
+WHEN NOT MATCHED THEN INSERT (order_id, status, ...) VALUES (...)
 ```
 
-This way the spine always extends to today without any hardcoded year.
+Result: the existing row is UPDATED from `CONFIRMED` to `SHIPPED`. No duplicate is created.
+
+---
+
+**A5** —
+
+| | Generic test | Singular test |
+|---|---|---|
+| **Location** | Defined in `macros/` as `{% test name %}`, attached in `schema.yml` | `.sql` file in `tests/` |
+| **Reusable?** | Yes — attach to any column on any model | No — one test, one specific check |
+| **Example (Day 4)** | `not_negative` on `stg_products.unit_price` | `assert_order_amount_matches_quantity_x_price.sql` |
+
+---
+
+**A6** — dbt identifies a test macro by its name prefix: the macro must be named `test_<name>` (e.g. `test_not_negative`). When dbt encounters `- not_negative` in `schema.yml`, it looks for a macro named `test_not_negative` in the `macros/` folder and calls it, passing `model` and `column_name` automatically.
+
+You attach it in `schema.yml` exactly like a built-in test:
+
+```yaml
+- name: unit_price
+  tests:
+    - not_negative
+```
+
+No other configuration needed. dbt generates and runs the SQL from the macro body, substituting the actual model and column name at runtime.
+
+---
+
+**A7** — Tests report failures — they do NOT delete rows from staging tables. The staging table still contains the bad rows after a failed test. The gold layer is responsible for explicitly excluding them via WHERE clauses:
+
+**In `dim_products`:**
+```sql
+WHERE unit_price > 0    -- excludes product_id=7 with unit_price=-5.00
+```
+
+**In `fct_orders`:**
+```sql
+WHERE customer_id IN (SELECT customer_id FROM {{ ref('stg_customers') }})
+  AND ABS(total_amount - ROUND(quantity * unit_price, 2)) <= 0.01
+```
+
+The pattern is: **tests flag problems at the staging gate; gold model WHERE clauses filter them out**. Both layers have a role — tests alert the engineer; the WHERE clause protects the BI layer.
+
+---
+
+**A8** — SCD Type 2 (Slowly Changing Dimension Type 2) is a technique for tracking the full history of changes to a row. Instead of overwriting the old value, a new row is inserted with the new value, and the old row is "closed" with an end timestamp.
+
+Four columns dbt adds automatically:
+
+| Column | Meaning |
+|---|---|
+| `dbt_scd_id` | Unique hash per version of a row |
+| `dbt_updated_at` | When dbt detected this version |
+| `dbt_valid_from` | When this version became current |
+| `dbt_valid_to` | When superseded — `NULL` means it is the current row |
+
+To query only the current version:
+```sql
+WHERE dbt_valid_to IS NULL
+```
+
+---
+
+**A9** — Before the change: 1 row for Alice with `dbt_valid_to = NULL`.
+
+After updating `city` from `New York` to `Los Angeles`, re-seeding, re-running staging, and running `dbt snapshot`:
+
+| Row | city | dbt_valid_from | dbt_valid_to |
+|---|---|---|---|
+| 1 (old) | New York | 2024-11-28 10:00:00 | 2024-11-28 10:30:00 ← closed |
+| 2 (new) | Los Angeles | 2024-11-28 10:30:00 | NULL ← current |
+
+There are now **2 rows** for Alice. The old row is closed (`dbt_valid_to` is set). The new row is open (`dbt_valid_to = NULL`). This is the SCD Type 2 history preserved — you can query what Alice's city was at any point in time.
+
+---
+
+**A10** — `dim_customers` reads from `customers_snapshot` because the snapshot is the **history store** — it tracks every version of every customer. `dim_customers` applies `WHERE dbt_valid_to IS NULL` to get only the current version, turning the history into a clean current-state dimension.
+
+If `dim_customers` read directly from `stg_customers`, it would still show current data — but you would **lose the ability to do point-in-time analysis**. For example: "What city was Alice in when she placed her order in January?" cannot be answered without the snapshot. The snapshot also acts as an audit trail of every change.
+
+---
+
+**A11** — A surrogate key is a system-generated identifier (usually a hash or sequence) that uniquely identifies a row in a dimension table. It is used in place of the natural key (like `customer_id`) as the join key between fact and dimension tables.
+
+Reasons to use `MD5(CAST(customer_id AS VARCHAR))` over raw `customer_id`:
+
+1. **Source system conflicts.** If you ever merge data from two source systems, both may have `customer_id = 1`. The surrogate key hashes the source + the id together, keeping them distinct
+2. **Data type consistency.** Fact and dimension tables from different sources may have `customer_id` as INT in one and VARCHAR in another. The MD5 hash is always a VARCHAR of fixed length
+3. **Dimensional modeling convention.** Industry standard — fact tables reference dimension rows by surrogate key, never by natural key
+
+---
+
+**A12** — 
+
+**Dimension table** — describes *what* an entity is. Contains attributes about the entity that do not change frequently. One row per entity. Used for filtering and grouping in reports.
+
+**Fact table** — records *what happened*. Contains measurable events (orders, transactions, clicks) with numeric metrics (quantity, revenue) and foreign keys to dimensions.
+
+In the Day 4 project:
+- Dimensions: `dim_customers` (who is the customer), `dim_products` (what is the product)
+- Fact: `fct_orders` (what order happened)
+
+Linking columns (the join keys):
+```
+fct_orders.customer_key → dim_customers.customer_key
+fct_orders.product_key  → dim_products.product_key
+```
+
+---
+
+**A13** — With `dbt build`: **`fct_orders` is SKIPPED**. dbt sees that `assert_customer_exists_for_order` failed on `stg_orders`. Even though `stg_orders` itself built successfully, its test failure marks all downstream nodes (including `fct_orders`) as blocked. `fct_orders` never runs.
+
+With `dbt run` + `dbt test` as separate commands: `fct_orders` **builds and runs** even though the test fails — because `dbt run` does not check test results. Only when `dbt test` runs afterward do you see the failure, but `fct_orders` already contains the bad row (`order_id=11` with `customer_id=99`).
+
+This is why `dbt build` is the correct production command — bad data never propagates downstream.
+
+---
+
+**A14** — Those 3 rows **will NOT disappear** from `stg_orders`. Incremental models only ADD rows — they never delete. The incremental filter `WHERE order_date > (SELECT MAX(order_date) FROM {{ this }})` only looks for rows newer than what is in the table. It never checks whether existing rows have been removed from the source.
+
+To fix it:
+
+```bash
+dbt run --select stg_orders --full-refresh
+```
+
+`--full-refresh` drops and rebuilds the entire incremental table from scratch. Use this whenever:
+- Rows are deleted from the source
+- You change the model's SQL logic that affects historical rows
+- The table schema changes (new columns)
+
+---
+
+**A15** — Step by step:
+
+1. The deduplication CTE runs first, over ALL rows from `orders_raw`
+2. Both duplicates (`order_id=5`, `order_date=2024-02-20`) and the new row (`order_id=5`, `order_date=2024-03-01`) are in the CTE
+3. `ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY order_id)` — with two rows having the same `order_id`, the tiebreaker `ORDER BY order_id` is not meaningful (same value). The database picks one arbitrarily as `row_num=1`
+
+The issue here is a weak tiebreaker. In the Day 4 model the tiebreaker is just `ORDER BY order_id`, which does not distinguish between the two duplicates. In a real project you would use a more meaningful tiebreaker like `ORDER BY updated_at DESC` so the most recent version wins.
+
+4. After dedup: 1 row for `order_id=5` with `order_date=2024-02-20` (original)
+5. Incremental filter: `WHERE order_date > MAX(order_date already in table)` — if `2024-02-20` is already in the table, this row does NOT make it past the incremental filter
+6. Because `unique_key='order_id'` is set, even if it did make it through, it would MERGE/UPDATE rather than insert a duplicate
+
+---
+
+**A16** —
+
+```sql
+SELECT
+    s.customer_name,
+    s.city,
+    s.country
+FROM ECOMM_DB.SNAPSHOTS.CUSTOMERS_SNAPSHOT s
+WHERE s.customer_id = 1
+  AND s.dbt_valid_from <= '2024-02-01'
+  AND (s.dbt_valid_to > '2024-02-01' OR s.dbt_valid_to IS NULL);
+```
+
+This finds the row version that was **active on 2024-02-01** — meaning it had already started (`dbt_valid_from <= target_date`) and had not yet been closed (`dbt_valid_to > target_date`, or still open). Result: `New York`, which was Alice's city before she moved to Los Angeles.
+
+---
+
+**A17** — A star schema is a database design pattern where a central fact table is surrounded by dimension tables, connected via foreign keys (surrogate keys). The shape resembles a star when drawn — fact in the middle, dimensions radiating outward.
+
+```
+         dim_customers
+              │
+              │ customer_key
+              │
+fct_orders ──┤
+              │ product_key
+              │
+         dim_products
+```
+
+Why surrogate keys instead of natural keys:
+- Natural keys (`customer_id=1`) can collide when merging data from multiple source systems
+- Surrogate keys are always unique across all sources and data types
+- Dimension tables can be updated (new surrogate key for a new SCD version) without changing the fact table's join logic
+
+---
+
+**A18** — They serve different purposes and neither is redundant:
+
+**The singular test (`assert_customer_exists_for_order`):**
+- Runs at the **staging layer**
+- **Alerts the data engineer** that there is a data quality problem in the source
+- Answers: "Is our raw data clean?" and "Do we have an upstream ETL bug?"
+- Action: someone needs to fix the source system or the EL pipeline
+
+**The WHERE clause in `fct_orders`:**
+- Runs at the **gold layer**
+- **Protects BI tools and analysts** from ever seeing bad data
+- Answers: "Even if the source has a problem, is our gold layer clean?"
+- Action: automatic — no intervention needed, bad rows are silently excluded
+
+Together: the test raises an alarm (fix the source), the WHERE clause is a safety net (BI never sees bad data in the meantime). Removing the test means silent failures — bad data arrives, gold excludes it, but no one is alerted that the source is broken. Removing the WHERE clause means bad data reaches BI tools the moment a test is missed or bypassed.
